@@ -1,8 +1,10 @@
 'use client';
 
-import React, { useEffect } from 'react';
+import React, { useCallback, useEffect } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { useRecordingStop } from '@/hooks/useRecordingStop';
+import { useRecordingAutoStop } from '@/hooks/useRecordingAutoStop';
+import { RecordingStatus, useRecordingState } from '@/contexts/RecordingStateContext';
 
 /**
  * RecordingPostProcessingProvider
@@ -12,6 +14,7 @@ import { useRecordingStop } from '@/hooks/useRecordingStop';
  * - Global keyboard shortcut
  * - Overlay stop button
  * - Main UI stop button
+ * - Recording duration timer auto-stop
  *
  * It listens for the 'recording-stop-complete' event from Rust backend
  * and triggers the full post-processing flow (save to database, navigate, analytics)
@@ -22,10 +25,18 @@ export function RecordingPostProcessingProvider({ children }: { children: React.
   // These are only needed for the hook's local component state management
   const setIsRecording = () => { };
   const setIsRecordingDisabled = () => { };
+  const { setStatus } = useRecordingState();
 
   const {
     handleRecordingStop,
   } = useRecordingStop(setIsRecording, setIsRecordingDisabled);
+
+  const handleStopInitiated = useCallback(() => {
+    setStatus(RecordingStatus.STOPPING, 'Stopping recording...');
+  }, [setStatus]);
+
+  // Auto-stop when configured timer elapses (app-wide; survives home page unmount)
+  useRecordingAutoStop(handleRecordingStop, handleStopInitiated);
 
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;

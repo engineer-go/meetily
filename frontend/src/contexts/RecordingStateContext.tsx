@@ -24,6 +24,34 @@ export enum RecordingStatus {
   ERROR = 'error'                         // Error occurred
 }
 
+const MAX_DURATION_STORAGE_KEY = 'meetily.recordingMaxDurationSeconds';
+
+function readStoredMaxDurationSeconds(): number | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(MAX_DURATION_STORAGE_KEY);
+    if (raw === null || raw === '' || raw === 'null') return null;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed) || parsed <= 0) return null;
+    return Math.floor(parsed);
+  } catch {
+    return null;
+  }
+}
+
+function persistMaxDurationSeconds(seconds: number | null): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (seconds === null) {
+      localStorage.setItem(MAX_DURATION_STORAGE_KEY, 'null');
+    } else {
+      localStorage.setItem(MAX_DURATION_STORAGE_KEY, String(seconds));
+    }
+  } catch {
+    // Ignore quota / private-mode failures
+  }
+}
+
 interface RecordingState {
   isRecording: boolean;           // Is a recording session active
   isPaused: boolean;              // Is the recording paused
@@ -34,16 +62,22 @@ interface RecordingState {
   // NEW: Lifecycle status
   status: RecordingStatus;
   statusMessage?: string;  // Optional message for current status
+
+  /** Optional auto-stop limit in seconds (null = Off). Persisted preference. */
+  maxDurationSeconds: number | null;
 }
 
 interface RecordingStateContextType extends RecordingState {
   // NEW: Setters for status management
   setStatus: (status: RecordingStatus, message?: string) => void;
+  setMaxDurationSeconds: (seconds: number | null) => void;
 
   // Computed helpers (derived from status)
   isStopping: boolean;
   isProcessing: boolean;
   isSaving: boolean;
+  /** Seconds left until auto-stop; null when no limit or not recording */
+  remainingSeconds: number | null;
 }
 
 const RecordingStateContext = createContext<RecordingStateContextType | null>(null);
@@ -65,9 +99,16 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
     activeDuration: null,
     status: RecordingStatus.IDLE,  // NEW: Initialize with IDLE status
     statusMessage: undefined,       // NEW: No message initially
+    maxDurationSeconds: null,
   });
 
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Hydrate timer preference from localStorage after mount (SSR-safe)
+  useEffect(() => {
+    const stored = readStoredMaxDurationSeconds();
+    setState(prev => ({ ...prev, maxDurationSeconds: stored }));
+  }, []);
 
   // NEW: Status setter with logging
   const setStatus = useCallback((status: RecordingStatus, message?: string) => {
@@ -79,6 +120,15 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
       statusMessage: message,
     }));
   }, [state.status, state.isRecording, state.isPaused]);
+
+  const setMaxDurationSeconds = useCallback((seconds: number | null) => {
+    const normalized =
+      seconds === null || !Number.isFinite(seconds) || seconds <= 0
+        ? null
+        : Math.floor(seconds);
+    persistMaxDurationSeconds(normalized);
+    setState(prev => ({ ...prev, maxDurationSeconds: normalized }));
+  }, []);
 
   /**
    * Sync recording state with backend
@@ -225,14 +275,24 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
     syncWithBackend();
   }, []);
 
+  const remainingSeconds = useMemo(() => {
+    if (!state.isRecording || state.maxDurationSeconds === null) {
+      return null;
+    }
+    const elapsed = state.activeDuration ?? 0;
+    return Math.max(0, state.maxDurationSeconds - elapsed);
+  }, [state.isRecording, state.maxDurationSeconds, state.activeDuration]);
+
   // NEW: Computed helpers from status
   const contextValue = useMemo(() => ({
     ...state,
     setStatus,
+    setMaxDurationSeconds,
+    remainingSeconds,
     isStopping: state.status === RecordingStatus.STOPPING,
     isProcessing: state.status === RecordingStatus.PROCESSING_TRANSCRIPTS,
     isSaving: state.status === RecordingStatus.SAVING,
-  }), [state, setStatus]);
+  }), [state, setStatus, setMaxDurationSeconds, remainingSeconds]);
 
   return (
     <RecordingStateContext.Provider value={contextValue}>

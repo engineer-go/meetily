@@ -125,7 +125,7 @@ Build from source following our detailed guides:
 **Quick start:**
 
 ```bash
-git clone https://github.com/Zackriya-Solutions/meeting-minutes
+#git clone https://github.com/Zackriya-Solutions/meeting-minutes
 cd meeting-minutes/frontend
 pnpm install
 ./build-gpu.sh

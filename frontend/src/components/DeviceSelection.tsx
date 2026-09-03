@@ -372,7 +372,10 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
       {/* Info text */}
       <div className="text-xs text-gray-500 space-y-1">
         <p>• <strong>Microphone:</strong> Records your voice and ambient sound</p>
-        <p>• <strong>System Audio:</strong> Records computer audio (music, calls, etc.)</p>
+        <p>• <strong>System Audio:</strong> Records computer audio (Chrome, Google Meet, music)</p>
+        {outputDevices.some(device => device.name.startsWith('Monitor of ')) && (
+          <p>• <strong>Linux:</strong> Choose <strong>Monitor of ...</strong> for the speakers or headphones that play the meeting</p>
+        )}
         {isMonitoring && (
           <p>• <strong>Mic Levels:</strong> Green = good, Yellow = loud, Red = too loud</p>
         )}

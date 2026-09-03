@@ -22,6 +22,11 @@ pub enum StreamBackend {
     CoreAudio {
         task: Option<tokio::task::JoinHandle<()>>,
     },
+    /// PipeWire sink-monitor capture (Linux system audio)
+    #[cfg(target_os = "linux")]
+    PipeWire {
+        task: Option<tokio::task::JoinHandle<()>>,
+    },
 }
 
 // SAFETY: While Stream doesn't implement Send, we ensure it's only accessed
@@ -85,6 +90,12 @@ impl AudioStream {
         if use_core_audio {
             info!("🎵 Stream: Using Core Audio backend (cidre) for system audio");
             return Self::create_core_audio_stream(device, state, device_type, recording_sender).await;
+        }
+
+        #[cfg(target_os = "linux")]
+        if device_type == DeviceType::System {
+            info!("🎵 Stream: Using PipeWire sink monitor for system audio");
+            return Self::create_pipewire_monitor_stream(device, state, recording_sender).await;
         }
 
         // Default path: use CPAL
@@ -233,6 +244,26 @@ impl AudioStream {
         })
     }
 
+    /// Create a PipeWire sink-monitor stream (Linux system audio)
+    #[cfg(target_os = "linux")]
+    async fn create_pipewire_monitor_stream(
+        device: Arc<AudioDevice>,
+        state: Arc<RecordingState>,
+        recording_sender: Option<mpsc::UnboundedSender<super::recording_state::AudioChunk>>,
+    ) -> Result<Self> {
+        info!("🔊 Stream: Creating PipeWire monitor stream for device: {}", device.name);
+        let task = super::linux_system_audio::spawn_monitor_capture(
+            device.clone(),
+            state,
+            recording_sender,
+        )?;
+
+        Ok(Self {
+            device,
+            backend: StreamBackend::PipeWire { task: Some(task) },
+        })
+    }
+
     /// Build stream based on sample format
     fn build_stream(
         device: &Device,
@@ -341,6 +372,15 @@ impl AudioStream {
                     // This helps ensure Arc references in the closure are dropped
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     info!("Core Audio task aborted");
+                }
+            }
+            #[cfg(target_os = "linux")]
+            StreamBackend::PipeWire { task } => {
+                if let Some(task_handle) = task {
+                    info!("Aborting PipeWire monitor capture task...");
+                    task_handle.abort();
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    info!("PipeWire monitor capture task aborted");
                 }
             }
         }

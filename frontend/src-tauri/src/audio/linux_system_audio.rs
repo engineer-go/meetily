@@ -4,15 +4,16 @@
 // PipeWire exposes a monitor on each sink; pw-cat records that monitor.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Stdio;
-use std::sync::Arc;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use log::{info, warn};
+use log::{debug, info, warn};
 use serde_json::Value;
-use tokio::io::AsyncReadExt;
-use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc;
 
 use super::devices::{AudioDevice, DeviceType as AudioDeviceType};
@@ -22,6 +23,9 @@ use super::recording_state::{DeviceType, RecordingState};
 const SAMPLE_RATE: u32 = 48000;
 const CHANNELS: u16 = 2;
 const MONITOR_PREFIX: &str = "Monitor of ";
+const SINK_CACHE_TTL: Duration = Duration::from_secs(5);
+
+static SINK_CACHE: Mutex<Option<(Instant, Vec<PipeWireSink>)>> = Mutex::new(None);
 
 #[derive(Clone, Debug)]
 pub struct PipeWireSink {
@@ -31,20 +35,43 @@ pub struct PipeWireSink {
     pub is_default: bool,
 }
 
+/// Owning handle for the dedicated pw-cat capture thread.
+pub struct PipeWireCaptureHandle {
+    stop: Arc<AtomicBool>,
+    child: Arc<Mutex<Option<Child>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PipeWireCaptureHandle {
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Ok(mut child_guard) = self.child.lock() {
+            if let Some(mut child) = child_guard.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for PipeWireCaptureHandle {
+    fn drop(&mut self) {
+        if self.thread.is_some() {
+            self.stop();
+        }
+    }
+}
+
 /// List PipeWire playback sinks as system-audio devices (their monitors).
 pub fn list_monitor_devices() -> Vec<AudioDevice> {
     match list_sinks() {
-        Ok(sinks) => {
-            if sinks.is_empty() {
-                warn!("No PipeWire sinks found for system audio capture");
-            } else {
-                info!("Found {} PipeWire sink monitor(s) for system audio", sinks.len());
-            }
-            sinks
-                .into_iter()
-                .map(|sink| AudioDevice::new(sink.display_name, AudioDeviceType::Output))
-                .collect()
-        }
+        Ok(sinks) => sinks
+            .into_iter()
+            .map(|sink| AudioDevice::new(sink.display_name, AudioDeviceType::Output))
+            .collect(),
         Err(e) => {
             warn!("Failed to list PipeWire sinks: {}", e);
             Vec::new()
@@ -68,12 +95,12 @@ pub fn default_monitor_device() -> Result<AudioDevice> {
     Ok(AudioDevice::new(sink.display_name.clone(), AudioDeviceType::Output))
 }
 
-/// Spawn pw-cat against the sink monitor and feed samples into the recording pipeline.
+/// Spawn pw-cat on a dedicated OS thread so device-monitor/pw-dump cannot stall capture.
 pub fn spawn_monitor_capture(
     device: Arc<AudioDevice>,
     state: Arc<RecordingState>,
     recording_sender: Option<mpsc::UnboundedSender<super::recording_state::AudioChunk>>,
-) -> Result<tokio::task::JoinHandle<()>> {
+) -> Result<PipeWireCaptureHandle> {
     let sink = resolve_sink(&device.name)?;
     let pw_cat = find_pw_cat()?;
 
@@ -95,19 +122,58 @@ pub fn spawn_monitor_capture(
 
     let node_name = sink.name.clone();
     let device_name = device.name.clone();
+    let stop = Arc::new(AtomicBool::new(false));
+    let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+    let stop_for_thread = stop.clone();
+    let child_for_thread = child_slot.clone();
 
-    Ok(tokio::spawn(async move {
-        if let Err(e) = run_pw_cat_capture(pw_cat, node_name, capture).await {
-            warn!("PipeWire monitor capture ended for '{}': {}", device_name, e);
-        } else {
-            info!("PipeWire monitor capture stopped for '{}'", device_name);
-        }
-    }))
+    let thread = std::thread::Builder::new()
+        .name("meetily-pw-cat".to_string())
+        .spawn(move || {
+            if let Err(e) = run_pw_cat_capture(
+                pw_cat,
+                node_name,
+                capture,
+                stop_for_thread,
+                child_for_thread,
+            ) {
+                warn!("PipeWire monitor capture ended for '{}': {}", device_name, e);
+            } else {
+                info!("PipeWire monitor capture stopped for '{}'", device_name);
+            }
+        })
+        .context("failed to spawn PipeWire capture thread")?;
+
+    Ok(PipeWireCaptureHandle {
+        stop,
+        child: child_slot,
+        thread: Some(thread),
+    })
 }
 
 fn list_sinks() -> Result<Vec<PipeWireSink>> {
+    {
+        let cache = SINK_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((fetched_at, sinks)) = cache.as_ref() {
+            if fetched_at.elapsed() < SINK_CACHE_TTL {
+                return Ok(sinks.clone());
+            }
+        }
+    }
+
+    let sinks = list_sinks_from_pw_dump()?;
+    info!("Found {} PipeWire sink monitor(s) for system audio", sinks.len());
+
+    if let Ok(mut cache) = SINK_CACHE.lock() {
+        *cache = Some((Instant::now(), sinks.clone()));
+    }
+
+    Ok(sinks)
+}
+
+fn list_sinks_from_pw_dump() -> Result<Vec<PipeWireSink>> {
     let pw_dump = which::which("pw-dump").context("pw-dump not found (install pipewire)")?;
-    let output = std::process::Command::new(pw_dump)
+    let output = Command::new(pw_dump)
         .output()
         .context("failed to run pw-dump")?;
 
@@ -267,12 +333,14 @@ fn find_pw_cat() -> Result<PathBuf> {
         .context("pw-cat not found (install pipewire)")
 }
 
-async fn run_pw_cat_capture(
+fn run_pw_cat_capture(
     pw_cat: PathBuf,
     node_name: String,
     capture: AudioCapture,
+    stop: Arc<AtomicBool>,
+    child_slot: Arc<Mutex<Option<Child>>>,
 ) -> Result<()> {
-    let mut child = TokioCommand::new(&pw_cat)
+    let mut child = Command::new(&pw_cat)
         .args([
             "--record",
             "--raw",
@@ -292,29 +360,38 @@ async fn run_pw_cat_capture(
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("failed to start {}", pw_cat.display()))?;
-
-    if let Some(mut stderr) = child.stderr.take() {
-        tokio::spawn(async move {
-            let mut buf = String::new();
-            if stderr.read_to_string(&mut buf).await.is_ok() && !buf.trim().is_empty() {
-                warn!("pw-cat stderr: {}", buf.trim());
-            }
-        });
-    }
 
     let mut stdout = child
         .stdout
         .take()
         .ok_or_else(|| anyhow!("pw-cat stdout was not captured"))?;
+    if let Some(mut err) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            if err.read_to_string(&mut buf).is_ok() && !buf.trim().is_empty() {
+                warn!("pw-cat stderr: {}", buf.trim());
+            }
+        });
+    }
+
+    {
+        let mut slot = child_slot.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = Some(child);
+    }
 
     let mut leftover = Vec::new();
     let mut read_buf = vec![0u8; 8192];
+    let buffers_seen = AtomicU64::new(0);
+    let mut logged_first_audio = false;
 
     loop {
-        let n = stdout.read(&mut read_buf).await?;
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let n = stdout.read(&mut read_buf)?;
         if n == 0 {
             break;
         }
@@ -330,13 +407,39 @@ async fn run_pw_cat_capture(
             samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
         leftover.drain(..complete);
+
+        if !samples.is_empty() {
+            let rms = (samples.iter().map(|&x| x * x).sum::<f32>() / samples.len() as f32).sqrt();
+            if !logged_first_audio {
+                info!(
+                    "PipeWire monitor first buffer: {} samples, RMS={:.4}",
+                    samples.len(),
+                    rms
+                );
+                logged_first_audio = true;
+            } else {
+                let seen = buffers_seen.fetch_add(1, Ordering::Relaxed);
+                if seen % 200 == 0 {
+                    debug!(
+                        "PipeWire monitor buffer {}: {} samples, RMS={:.4}",
+                        seen,
+                        samples.len(),
+                        rms
+                    );
+                }
+            }
+        }
+
         capture.process_audio_data(&samples);
     }
 
-    let status = child.wait().await?;
-    if !status.success() {
-        return Err(anyhow!("pw-cat exited with {}", status));
+    if let Ok(mut slot) = child_slot.lock() {
+        if let Some(mut child) = slot.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
+
     Ok(())
 }
 

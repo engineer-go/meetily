@@ -25,7 +25,7 @@ pub enum StreamBackend {
     /// PipeWire sink-monitor capture (Linux system audio)
     #[cfg(target_os = "linux")]
     PipeWire {
-        task: Option<tokio::task::JoinHandle<()>>,
+        handle: Option<super::linux_system_audio::PipeWireCaptureHandle>,
     },
 }
 
@@ -252,7 +252,7 @@ impl AudioStream {
         recording_sender: Option<mpsc::UnboundedSender<super::recording_state::AudioChunk>>,
     ) -> Result<Self> {
         info!("🔊 Stream: Creating PipeWire monitor stream for device: {}", device.name);
-        let task = super::linux_system_audio::spawn_monitor_capture(
+        let handle = super::linux_system_audio::spawn_monitor_capture(
             device.clone(),
             state,
             recording_sender,
@@ -260,7 +260,7 @@ impl AudioStream {
 
         Ok(Self {
             device,
-            backend: StreamBackend::PipeWire { task: Some(task) },
+            backend: StreamBackend::PipeWire { handle: Some(handle) },
         })
     }
 
@@ -375,12 +375,11 @@ impl AudioStream {
                 }
             }
             #[cfg(target_os = "linux")]
-            StreamBackend::PipeWire { task } => {
-                if let Some(task_handle) = task {
-                    info!("Aborting PipeWire monitor capture task...");
-                    task_handle.abort();
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    info!("PipeWire monitor capture task aborted");
+            StreamBackend::PipeWire { handle } => {
+                if let Some(mut capture_handle) = handle {
+                    info!("Stopping PipeWire monitor capture thread...");
+                    capture_handle.stop();
+                    info!("PipeWire monitor capture stopped");
                 }
             }
         }

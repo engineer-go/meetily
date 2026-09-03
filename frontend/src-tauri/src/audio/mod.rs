@@ -14,6 +14,7 @@ pub mod permissions;
 pub mod device_detection;
 pub mod diagnostics;
 pub mod ffmpeg_mixer;  // NEW: FFmpeg-style adaptive audio mixer
+pub mod echo_cancel;
 
 // New simplified audio system
 pub mod recording_state;

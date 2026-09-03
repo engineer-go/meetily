@@ -4,32 +4,47 @@
 
 use log::{debug, info};
 
-const FILTER_TAPS: usize = 512;
-const NLMS_MU: f32 = 0.25;
+/// ~43 ms of room impulse after bulk delay. 512 taps (~11 ms) left too much reverb.
+const FILTER_TAPS: usize = 2048;
+const NLMS_MU: f32 = 0.2;
 const NLMS_EPS: f32 = 1e-6;
 const SYS_FLOOR: f32 = 0.004;
 const DELAY_CORR_MIN: f32 = 0.18;
-const MAX_DELAY_MS: u32 = 150;
+const MAX_DELAY_MS: u32 = 250;
 const MIN_DELAY_MS: i32 = -40;
+const RES_FLOOR: f32 = 0.01;
+const RES_MIN_GAIN: f32 = 0.04;
 
 pub struct AcousticEchoCanceller {
     sample_rate: u32,
     weights: Vec<f32>,
     reference: Vec<f32>,
     ref_index: usize,
+    ref_power: f32,
+    sys_history: Vec<f32>,
+    sys_hist_pos: usize,
+    sys_hist_filled: usize,
     delay_samples: i32,
     windows_processed: u32,
+    res_gain: f32,
 }
 
 impl AcousticEchoCanceller {
     pub fn new(sample_rate: u32) -> Self {
+        let max_delay = ((sample_rate as u64 * MAX_DELAY_MS as u64) / 1000) as usize;
+        let history_len = (max_delay + FILTER_TAPS + 1).max(1);
         Self {
             sample_rate,
             weights: vec![0.0; FILTER_TAPS],
             reference: vec![0.0; FILTER_TAPS],
             ref_index: 0,
+            ref_power: 0.0,
+            sys_history: vec![0.0; history_len],
+            sys_hist_pos: 0,
+            sys_hist_filled: 0,
             delay_samples: 0,
             windows_processed: 0,
+            res_gain: 1.0,
         }
     }
 
@@ -40,23 +55,7 @@ impl AcousticEchoCanceller {
         }
 
         if let Some(delay) = estimate_delay_samples(mic, sys, self.sample_rate) {
-            if delay != self.delay_samples {
-                if self.windows_processed == 0 || delay.abs_diff(self.delay_samples) > 240 {
-                    info!(
-                        "AEC aligned speaker echo: delay={} samples ({:.0} ms)",
-                        delay,
-                        delay as f32 / self.sample_rate as f32 * 1000.0
-                    );
-                } else {
-                    debug!(
-                        "AEC delay updated: {} -> {} samples ({:.1} ms)",
-                        self.delay_samples,
-                        delay,
-                        delay as f32 / self.sample_rate as f32 * 1000.0
-                    );
-                }
-                self.delay_samples = delay;
-            }
+            self.update_delay(delay);
         }
 
         let sys_rms = rms(sys);
@@ -69,12 +68,20 @@ impl AcousticEchoCanceller {
         let mut cleaned = Vec::with_capacity(len);
         for i in 0..len {
             let mic_s = mic.get(i).copied().unwrap_or(0.0);
-            let sys_s = sample_with_delay(sys, i, self.delay_samples);
+            let sys_now = sys.get(i).copied().unwrap_or(0.0);
+            self.push_sys(sys_now);
+            let sys_s = self.reference_sample(sys, i);
 
+            let old = self.reference[self.ref_index];
             self.reference[self.ref_index] = sys_s;
+            self.ref_power += sys_s * sys_s - old * old;
+            if self.ref_power < 0.0 {
+                self.ref_power = 0.0;
+            }
+
             let echo_est = self.filter_output();
-            let err = mic_s - echo_est;
-            cleaned.push(err.clamp(-1.0, 1.0));
+            let err = (mic_s - echo_est).clamp(-1.0, 1.0);
+            cleaned.push(err);
 
             if adapt {
                 self.nlms_update(err);
@@ -83,8 +90,71 @@ impl AcousticEchoCanceller {
             self.ref_index = (self.ref_index + 1) % FILTER_TAPS;
         }
 
+        if system_present && !near_end_talk {
+            let cleaned_rms = rms(&cleaned);
+            let target = (RES_FLOOR / (cleaned_rms + RES_FLOOR)).clamp(RES_MIN_GAIN, 1.0);
+            self.res_gain = 0.85 * self.res_gain + 0.15 * target;
+            if self.res_gain < 0.95 {
+                for sample in &mut cleaned {
+                    *sample *= self.res_gain;
+                }
+            }
+        } else {
+            self.res_gain = 0.85 * self.res_gain + 0.15;
+        }
+
         self.windows_processed = self.windows_processed.saturating_add(1);
         cleaned
+    }
+
+    fn update_delay(&mut self, delay: i32) {
+        if delay == self.delay_samples {
+            return;
+        }
+        let jumped = self.windows_processed == 0 || delay.abs_diff(self.delay_samples) > 240;
+        if jumped {
+            info!(
+                "AEC aligned speaker echo: delay={} samples ({:.0} ms)",
+                delay,
+                delay as f32 / self.sample_rate as f32 * 1000.0
+            );
+            self.weights.fill(0.0);
+            self.reference.fill(0.0);
+            self.ref_power = 0.0;
+        } else {
+            debug!(
+                "AEC delay updated: {} -> {} samples ({:.1} ms)",
+                self.delay_samples,
+                delay,
+                delay as f32 / self.sample_rate as f32 * 1000.0
+            );
+        }
+        self.delay_samples = delay;
+    }
+
+    fn push_sys(&mut self, sample: f32) {
+        let len = self.sys_history.len();
+        self.sys_history[self.sys_hist_pos] = sample;
+        self.sys_hist_pos = (self.sys_hist_pos + 1) % len;
+        if self.sys_hist_filled < len {
+            self.sys_hist_filled += 1;
+        }
+    }
+
+    fn reference_sample(&self, sys: &[f32], index: usize) -> f32 {
+        if self.delay_samples < 0 {
+            return sys
+                .get(index + (-self.delay_samples) as usize)
+                .copied()
+                .unwrap_or(0.0);
+        }
+        let delay = self.delay_samples as usize;
+        if delay >= self.sys_hist_filled {
+            return 0.0;
+        }
+        let len = self.sys_history.len();
+        let idx = (self.sys_hist_pos + len - 1 - delay) % len;
+        self.sys_history[idx]
     }
 
     fn filter_output(&self) -> f32 {
@@ -98,25 +168,13 @@ impl AcousticEchoCanceller {
     }
 
     fn nlms_update(&mut self, error: f32) {
-        let mut power = NLMS_EPS;
-        for sample in &self.reference {
-            power += sample * sample;
-        }
+        let power = self.ref_power + NLMS_EPS;
         let step = NLMS_MU * error / power;
         let mut idx = self.ref_index;
         for weight in &mut self.weights {
             *weight += step * self.reference[idx];
             idx = if idx == 0 { FILTER_TAPS - 1 } else { idx - 1 };
         }
-    }
-}
-
-fn sample_with_delay(sys: &[f32], index: usize, delay: i32) -> f32 {
-    let src = index as i32 - delay;
-    if src < 0 || src as usize >= sys.len() {
-        0.0
-    } else {
-        sys[src as usize]
     }
 }
 
@@ -201,7 +259,7 @@ mod tests {
             mic[i] = 0.5 * sys[i - delay];
         }
 
-        let window = 28800;
+        let window = 4800;
         let mut cleaned = Vec::new();
         for start in (0..n).step_by(window) {
             let end = (start + window).min(n);

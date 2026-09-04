@@ -1,13 +1,15 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { useRouter } from 'next/navigation';
 import { listen } from '@tauri-apps/api/event';
+import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
+import { useConfig } from '@/contexts/ConfigContext';
 import { storageService } from '@/services/storageService';
 import { transcriptService } from '@/services/transcriptService';
 import Analytics from '@/lib/analytics';
+import { openMeetingDetails } from '@/lib/meetingNavigation';
 import {
   applyPinnedSummaryLanguageToMeeting,
   detectAndCacheSummaryLanguage,
@@ -17,6 +19,9 @@ type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'c
 
 interface UseRecordingStopReturn {
   handleRecordingStop: (callApi: boolean) => Promise<void>;
+  cancelPostSaveTranscription: () => Promise<void>;
+  openSavedMeeting: () => void;
+  savedMeetingId: string | null;
   isStopping: boolean;
   isProcessingTranscript: boolean;
   isSavingTranscript: boolean;
@@ -59,21 +64,25 @@ export function useRecordingStop(
     markMeetingAsSaved,
   } = useTranscripts();
 
+  const { selectedLanguage, transcriptModelConfig } = useConfig();
+
   const {
     refetchMeetings,
     setCurrentMeeting,
-    setMeetings,
-    meetings,
     setIsMeetingActive,
   } = useSidebar();
-
-  const router = useRouter();
 
   // Guard to prevent duplicate/concurrent stop calls (e.g., from UI and tray simultaneously)
   const stopInProgressRef = useRef(false);
 
   // Promise to track recording-stopped event data (fixes race condition with recording-stop-complete)
   const recordingStoppedDataRef = useRef<Promise<void> | null>(null);
+  const postSaveNavRef = useRef<{
+    meetingId: string;
+    cancelled: boolean;
+    transcribeAfterSave: boolean;
+  } | null>(null);
+  const [savedMeetingId, setSavedMeetingId] = useState<string | null>(null);
 
   // Set up recording-stopped listener for meeting navigation
   useEffect(() => {
@@ -86,10 +95,11 @@ export function useRecordingStop(
           message: string;
           folder_path?: string;
           meeting_name?: string;
+          transcribe_after_save?: boolean;
         }>('recording-stopped', async (event) => {
           // Create promise that resolves when sessionStorage is set (prevents race condition)
           recordingStoppedDataRef.current = (async () => {
-            const { folder_path, meeting_name } = event.payload;
+            const { folder_path, meeting_name, transcribe_after_save } = event.payload;
 
             // Store folder_path and meeting_name for later use in handleRecordingStop
             if (folder_path) {
@@ -98,6 +108,10 @@ export function useRecordingStop(
             if (meeting_name) {
               sessionStorage.setItem('last_recording_meeting_name', meeting_name);
             }
+            sessionStorage.setItem(
+              'last_recording_transcribe_after_save',
+              transcribe_after_save ? 'true' : 'false'
+            );
           })();
 
         });
@@ -115,7 +129,22 @@ export function useRecordingStop(
         unlistenFn();
       }
     };
-  }, [router]);
+  }, []);
+
+  const navigateToSavedMeeting = useCallback((meetingId?: string) => {
+    const nav = postSaveNavRef.current;
+    const id = meetingId || nav?.meetingId || savedMeetingId;
+    if (!id) {
+      console.warn('No saved meeting id available for navigation');
+      return;
+    }
+    const transcribing = Boolean(nav?.transcribeAfterSave && !nav.cancelled);
+    clearTranscripts();
+    setIsMeetingActive(false);
+    setStatus(RecordingStatus.IDLE);
+    Analytics.trackPageView('meeting_details');
+    openMeetingDetails(id, { source: 'recording', transcribing });
+  }, [savedMeetingId, clearTranscripts, setIsMeetingActive, setStatus]);
 
   // Main recording stop handler
   const handleRecordingStop = useCallback(async (isCallApi: boolean) => {
@@ -128,6 +157,7 @@ export function useRecordingStop(
       return;
     }
     stopInProgressRef.current = true;
+    postSaveNavRef.current = null;
 
     // Set status to STOPPING immediately
     setStatus(RecordingStatus.STOPPING);
@@ -145,6 +175,21 @@ export function useRecordingStop(
       // This function only handles post-stop processing (transcription wait, API call, navigation)
       console.log('Recording already stopped by RecordingControls, processing transcription...');
 
+      const recordingPrefs = await invoke<{
+        transcribe_after_save?: boolean;
+        auto_save?: boolean;
+      }>('get_recording_preferences');
+      const transcribeAfterSaveFlag = sessionStorage.getItem('last_recording_transcribe_after_save');
+      const transcribeAfterSave = transcribeAfterSaveFlag !== null
+        ? transcribeAfterSaveFlag === 'true'
+        : (recordingPrefs.transcribe_after_save ?? true) && (recordingPrefs.auto_save ?? true);
+
+      let transcriptionComplete = transcribeAfterSave;
+
+      if (transcribeAfterSave) {
+        setStatus(RecordingStatus.SAVING, 'File saved, starting transcription...');
+        console.log('Save-first mode: audio file already written, skipping live transcription wait');
+      } else {
       // Wait for transcription to complete
       setStatus(RecordingStatus.PROCESSING_TRANSCRIPTS, 'Waiting for transcription...');
       console.log('Waiting for transcription to complete...');
@@ -152,7 +197,6 @@ export function useRecordingStop(
       const MAX_WAIT_TIME = 60000; // 60 seconds maximum wait (increased for longer processing)
       const POLL_INTERVAL = 500; // Check every 500ms
       let elapsedTime = 0;
-      let transcriptionComplete = false;
 
       // Listen for transcription-complete event
       const unlistenComplete = await listen('transcription-complete', () => {
@@ -207,6 +251,7 @@ export function useRecordingStop(
         console.log('⏳ Waiting for late transcript segments...');
         await new Promise(resolve => setTimeout(resolve, 4000));
       }
+      }
 
       // Final buffer flush: process ALL remaining transcripts regardless of timing
       const flushStartTime = Date.now();
@@ -215,7 +260,9 @@ export function useRecordingStop(
         time_since_stop: flushStartTime - stopStartTime,
         current_transcript_count: transcriptsRef.current.length
       });
-      setStatus(RecordingStatus.PROCESSING_TRANSCRIPTS, 'Flushing transcript buffer...');
+      if (!transcribeAfterSave) {
+        setStatus(RecordingStatus.PROCESSING_TRANSCRIPTS, 'Flushing transcript buffer...');
+      }
       flushBuffer();
       const flushEndTime = Date.now();
       console.log('✅ Final buffer flush completed', {
@@ -227,15 +274,20 @@ export function useRecordingStop(
       // NOTE: Status remains PROCESSING_TRANSCRIPTS until we start saving
 
       // Wait a bit more to ensure all transcript state updates have been processed
-      console.log('Waiting for transcript state updates to complete...');
-      await new Promise(resolve => setTimeout(resolve, 500));
+      if (!transcribeAfterSave) {
+        console.log('Waiting for transcript state updates to complete...');
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
 
       // Save to SQLite
       // NOTE: enabled to save COMPLETE transcripts after frontend receives all updates
       // This ensures user sees all transcripts streaming in before database save
-      if (isCallApi && transcriptionComplete == true) {
+      if (isCallApi && (transcriptionComplete || transcribeAfterSave)) {
 
-        setStatus(RecordingStatus.SAVING, 'Saving meeting to database...');
+        setStatus(
+          RecordingStatus.SAVING,
+          transcribeAfterSave ? 'File saved, saving meeting...' : 'Saving meeting to database...'
+        );
 
         // Get fresh transcript state (ALL transcripts including late ones)
         const freshTranscripts = [...transcriptsRef.current];
@@ -293,57 +345,72 @@ export function useRecordingStop(
           console.log('   Transcripts:', freshTranscripts.length);
           console.log('   folder_path:', folderPath);
 
+          postSaveNavRef.current = {
+            meetingId,
+            cancelled: false,
+            transcribeAfterSave,
+          };
+          setSavedMeetingId(meetingId);
+          setCurrentMeeting({
+            id: meetingId,
+            title: savedMeetingName || meetingTitle || 'New Meeting',
+          });
+
           // Mark meeting as saved in IndexedDB (for recovery system)
           await markMeetingAsSaved();
 
           // Clean up session storage
           sessionStorage.removeItem('last_recording_folder_path');
           sessionStorage.removeItem('last_recording_meeting_name');
+          sessionStorage.removeItem('last_recording_transcribe_after_save');
           // Clean up IndexedDB meeting ID (redundant with markMeetingAsSaved cleanup, but ensures cleanup)
           sessionStorage.removeItem('indexeddb_current_meeting_id');
 
-          // Refetch meetings and set current meeting
-          await refetchMeetings();
+          void refetchMeetings();
 
-          try {
-            const meetingData = await storageService.getMeeting(meetingId);
-            if (meetingData) {
-              setCurrentMeeting({
-                id: meetingId,
-                title: meetingData.title
+          if (transcribeAfterSave && folderPath) {
+            setStatus(RecordingStatus.PROCESSING_TRANSCRIPTS, 'File saved, starting transcription...');
+            const isParakeet = transcriptModelConfig.provider === 'parakeet';
+            const languageToSend = isParakeet || selectedLanguage === 'auto' ? null : selectedLanguage;
+            try {
+              await invoke('start_retranscription_command', {
+                meetingId,
+                meetingFolderPath: folderPath,
+                language: languageToSend,
+                model: transcriptModelConfig.model || null,
+                provider: isParakeet ? 'parakeet' : 'whisper',
               });
-              console.log('✅ Current meeting set:', meetingData.title);
+            } catch (startError) {
+              console.error('Failed to start post-save transcription:', startError);
+              toast.error('File saved, but transcription did not start', {
+                description: startError instanceof Error ? startError.message : String(startError),
+              });
             }
-          } catch (error) {
-            console.warn('Could not fetch meeting details, using ID only:', error);
-            setCurrentMeeting({ id: meetingId, title: savedMeetingName || meetingTitle || 'New Meeting' });
           }
 
-          // Mark as completed
-          setStatus(RecordingStatus.COMPLETED);
+          setStatus(
+            transcribeAfterSave
+              ? RecordingStatus.PROCESSING_TRANSCRIPTS
+              : RecordingStatus.COMPLETED,
+            transcribeAfterSave ? 'File saved, opening meeting...' : undefined
+          );
 
-          // Show success toast with navigation option
-          toast.success('Recording saved successfully!', {
-            description: `${freshTranscripts.length} transcript segments saved.`,
+          toast.success(transcribeAfterSave ? 'File saved' : 'Recording saved successfully!', {
+            description: transcribeAfterSave
+              ? 'Opening meeting and starting transcription...'
+              : `${freshTranscripts.length} transcript segments saved.`,
             action: {
               label: 'View Meeting',
               onClick: () => {
-                router.push(`/meeting-details?id=${meetingId}`);
                 Analytics.trackButtonClick('view_meeting_from_toast', 'recording_complete');
-              }
+                navigateToSavedMeeting(meetingId);
+              },
             },
-            duration: 10000,
+            duration: 8000,
+            position: 'top-center',
           });
 
-          // Auto-navigate after a short delay with source parameter
-          setTimeout(() => {
-            router.push(`/meeting-details?id=${meetingId}&source=recording`);
-            clearTranscripts()
-            Analytics.trackPageView('meeting_details');
-
-            // Reset to IDLE after navigation
-            setStatus(RecordingStatus.IDLE);
-          }, 2000);
+          navigateToSavedMeeting(meetingId);
           // Track meeting completion analytics
           try {
             // Calculate meeting duration from transcript timestamps
@@ -426,16 +493,44 @@ export function useRecordingStop(
     setStatus,
     transcriptsRef,
     flushBuffer,
-    clearTranscripts,
     meetingTitle,
     markMeetingAsSaved,
     refetchMeetings,
     setCurrentMeeting,
-    setMeetings,
-    meetings,
     setIsMeetingActive,
-    router,
+    selectedLanguage,
+    transcriptModelConfig,
+    navigateToSavedMeeting,
   ]);
+
+  const cancelPostSaveTranscription = useCallback(async () => {
+    if (postSaveNavRef.current) {
+      postSaveNavRef.current.cancelled = true;
+    }
+    setStatus(RecordingStatus.IDLE);
+    toast.dismiss();
+    toast.info('Transcription cancelled', {
+      description: 'The audio file is saved.',
+      action: {
+        label: 'View Meeting',
+        onClick: () => {
+          Analytics.trackButtonClick('view_meeting_from_toast', 'transcription_cancelled');
+          navigateToSavedMeeting();
+        },
+      },
+      duration: 8000,
+      position: 'top-center',
+    });
+    try {
+      await invoke('cancel_retranscription_command');
+    } catch (error) {
+      console.error('Failed to cancel transcription:', error);
+    }
+  }, [navigateToSavedMeeting, setStatus]);
+
+  const openSavedMeeting = useCallback(() => {
+    navigateToSavedMeeting();
+  }, [navigateToSavedMeeting]);
 
   // Expose handleRecordingStop function to window for Rust callbacks
   const handleRecordingStopRef = useRef(handleRecordingStop);
@@ -459,6 +554,9 @@ export function useRecordingStop(
 
   return {
     handleRecordingStop,
+    cancelPostSaveTranscription,
+    openSavedMeeting,
+    savedMeetingId,
     isStopping,
     isProcessingTranscript,
     isSavingTranscript,

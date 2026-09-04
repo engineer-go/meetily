@@ -12,6 +12,7 @@ export interface RecordingPreferences {
   file_format: string;
   preferred_mic_device: string | null;
   preferred_system_device: string | null;
+  transcribe_after_save: boolean;
 }
 
 interface RecordingSettingsProps {
@@ -24,7 +25,8 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     auto_save: true,
     file_format: 'mp4',
     preferred_mic_device: null,
-    preferred_system_device: null
+    preferred_system_device: null,
+    transcribe_after_save: true
   });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -35,7 +37,10 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     const loadPreferences = async () => {
       try {
         const prefs = await invoke<RecordingPreferences>('get_recording_preferences');
-        setPreferences(prefs);
+        setPreferences({
+          ...prefs,
+          transcribe_after_save: prefs.transcribe_after_save ?? true,
+        });
       } catch (error) {
         console.error('Failed to load recording preferences:', error);
         // If loading fails, get default folder path
@@ -75,6 +80,16 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
 
     // Track auto-save setting change
     await Analytics.track('auto_save_recording_toggled', {
+      enabled: enabled.toString()
+    });
+  };
+
+  const handleTranscribeAfterSaveToggle = async (enabled: boolean) => {
+    const newPreferences = { ...preferences, transcribe_after_save: enabled };
+    setPreferences(newPreferences);
+    await savePreferences(newPreferences);
+
+    await Analytics.track('transcribe_after_save_toggled', {
       enabled: enabled.toString()
     });
   };
@@ -200,6 +215,20 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
             <div className="text-xs text-blue-600 mt-1">
               Recordings are saved with timestamp: recording_YYYYMMDD_HHMMSS.{preferences.file_format}
             </div>
+          </div>
+
+          <div className="flex items-center justify-between p-4 border rounded-lg">
+            <div className="flex-1 pr-4">
+              <div className="font-medium">Save file first, then transcribe</div>
+              <div className="text-sm text-gray-600">
+                Stop immediately writes the audio file, then transcribes that file. The meeting screen will show that the file is saved and transcription has started.
+              </div>
+            </div>
+            <Switch
+              checked={preferences.transcribe_after_save}
+              onCheckedChange={handleTranscribeAfterSaveToggle}
+              disabled={saving}
+            />
           </div>
         </div>
       )}

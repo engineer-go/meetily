@@ -11,6 +11,10 @@ use log::error;
 #[cfg(target_os = "macos")]
 use crate::audio::capture::AudioCaptureBackend;
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RecordingPreferences {
     pub save_folder: PathBuf,
@@ -20,6 +24,10 @@ pub struct RecordingPreferences {
     pub preferred_mic_device: Option<String>,
     #[serde(default)]
     pub preferred_system_device: Option<String>,
+    /// Save the audio file as soon as Stop is pressed, then transcribe that file.
+    /// Live chunks are not waited on before the file appears.
+    #[serde(default = "default_true")]
+    pub transcribe_after_save: bool,
     #[cfg(target_os = "macos")]
     #[serde(default)]
     pub system_audio_backend: Option<String>,
@@ -33,6 +41,7 @@ impl Default for RecordingPreferences {
             file_format: "mp4".to_string(),
             preferred_mic_device: None,
             preferred_system_device: None,
+            transcribe_after_save: true,
             #[cfg(target_os = "macos")]
             system_audio_backend: Some("coreaudio".to_string()),
         }
@@ -108,14 +117,15 @@ pub async fn load_recording_preferences<R: Runtime>(
     // Try to get the preferences from store
     let prefs = if let Some(value) = store.get("preferences") {
         match serde_json::from_value::<RecordingPreferences>(value.clone()) {
-            Ok(mut p) => {
+            Ok(p) => {
                 info!("Loaded recording preferences from store");
-                // Update macOS backend to current value if needed
                 #[cfg(target_os = "macos")]
-                {
+                let p = {
+                    let mut p = p;
                     let backend = crate::audio::capture::get_current_backend();
                     p.system_audio_backend = Some(backend.to_string());
-                }
+                    p
+                };
                 p
             }
             Err(e) => {
@@ -128,8 +138,8 @@ pub async fn load_recording_preferences<R: Runtime>(
         RecordingPreferences::default()
     };
 
-    info!("Loaded recording preferences: save_folder={:?}, auto_save={}, format={}, mic={:?}, system={:?}",
-          prefs.save_folder, prefs.auto_save, prefs.file_format,
+    info!("Loaded recording preferences: save_folder={:?}, auto_save={}, transcribe_after_save={}, format={}, mic={:?}, system={:?}",
+          prefs.save_folder, prefs.auto_save, prefs.transcribe_after_save, prefs.file_format,
           prefs.preferred_mic_device, prefs.preferred_system_device);
     Ok(prefs)
 }
@@ -139,8 +149,8 @@ pub async fn save_recording_preferences<R: Runtime>(
     app: &AppHandle<R>,
     preferences: &RecordingPreferences,
 ) -> Result<()> {
-    info!("Saving recording preferences: save_folder={:?}, auto_save={}, format={}, mic={:?}, system={:?}",
-          preferences.save_folder, preferences.auto_save, preferences.file_format,
+    info!("Saving recording preferences: save_folder={:?}, auto_save={}, transcribe_after_save={}, format={}, mic={:?}, system={:?}",
+          preferences.save_folder, preferences.auto_save, preferences.transcribe_after_save, preferences.file_format,
           preferences.preferred_mic_device, preferences.preferred_system_device);
 
     // Get or create store

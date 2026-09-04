@@ -1,10 +1,11 @@
 'use client';
 
 import React, { createContext, useContext, useState, useEffect } from 'react';
-import { usePathname, useRouter } from 'next/navigation';
+import { usePathname } from 'next/navigation';
 import Analytics from '@/lib/analytics';
 import { invoke } from '@tauri-apps/api/core';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
+import { isHomePath, openHome } from '@/lib/meetingNavigation';
 
 
 interface SidebarItem {
@@ -80,7 +81,6 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const { isRecording } = useRecordingState();
 
   const pathname = usePathname();
-  const router = useRouter();
 
   // Extract fetchMeetings as a reusable function
   const fetchMeetings = React.useCallback(async () => {
@@ -146,7 +146,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const handleRecordingToggle = () => {
     if (!isRecording) {
       // Check if already on home page
-      if (pathname === '/') {
+      if (isHomePath(pathname)) {
         // Already on home - trigger recording directly via custom event
         console.log('Triggering recording from sidebar (already on home page)');
         window.dispatchEvent(new CustomEvent('start-recording-from-sidebar'));
@@ -154,7 +154,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         // Not on home - navigate and use auto-start mechanism
         console.log('Navigating to home page with auto-start flag');
         sessionStorage.setItem('autoStartRecording', 'true');
-        router.push('/');
+        openHome();
       }
 
       // Track recording initiation from sidebar

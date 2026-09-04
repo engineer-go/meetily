@@ -1,3 +1,4 @@
+#[cfg(any(test, target_os = "windows"))]
 use std::path::Path;
 use std::sync::OnceLock;
 use log::info;
@@ -107,14 +108,13 @@ impl HardwareProfile {
 
     /// Detect available system memory in GB
     fn detect_memory_gb() -> u8 {
-        // Simple memory detection - could be enhanced with system-specific calls
-        match std::env::var("MEMORY_GB") {
-            Ok(mem_str) => mem_str.parse().unwrap_or(8),
-            Err(_) => {
-                // Default estimates based on common configurations
-                8 // Conservative default
-            }
+        if let Ok(mem_str) = std::env::var("MEMORY_GB") {
+            return mem_str.parse().unwrap_or(8);
         }
+        let mut system = sysinfo::System::new();
+        system.refresh_memory();
+        let gb = system.total_memory() / (1024 * 1024 * 1024);
+        gb.clamp(1, 255) as u8
     }
 
     /// Calculate performance tier based on hardware
@@ -196,58 +196,70 @@ impl HardwareProfile {
         Self::has_windows_vulkan_loader(Path::new(r"C:\Windows"))
     }
 
+    #[cfg(any(test, target_os = "windows"))]
     fn has_windows_vulkan_loader(system_root: &Path) -> bool {
         system_root.join("System32").join("vulkan-1.dll").is_file()
     }
 
     /// Generate adaptive Whisper configuration based on hardware
     pub fn get_whisper_config(&self) -> AdaptiveWhisperConfig {
-        // Windows-specific override: Always use beam size 2 for stability
-        #[cfg(target_os = "windows")]
-        {
-            return AdaptiveWhisperConfig {
-                beam_size: 2,
-                temperature: 0.2,
-                use_gpu: self.has_gpu_acceleration,
-                max_threads: Some(self.cpu_cores.min(8) as usize),
-                chunk_size_preference: ChunkSizePreference::Balanced,
-            };
-        }
-
-        // Platform-adaptive configuration for non-Windows systems
-        #[cfg(not(target_os = "windows"))]
-        {
-            match self.performance_tier {
-                PerformanceTier::Ultra => AdaptiveWhisperConfig {
-                    beam_size: 5,  // Maximum quality
-                    temperature: 0.1,
-                    use_gpu: self.has_gpu_acceleration,
-                    max_threads: Some(self.cpu_cores.min(8) as usize),
-                    chunk_size_preference: ChunkSizePreference::Quality,
-                },
-                PerformanceTier::High => AdaptiveWhisperConfig {
-                    beam_size: 3,  // High quality
+        let mut config = {
+            #[cfg(target_os = "windows")]
+            {
+                AdaptiveWhisperConfig {
+                    beam_size: 2,
                     temperature: 0.2,
                     use_gpu: self.has_gpu_acceleration,
-                    max_threads: Some(self.cpu_cores.min(6) as usize),
+                    max_threads: Some(self.cpu_cores.min(8) as usize),
                     chunk_size_preference: ChunkSizePreference::Balanced,
-                },
-                PerformanceTier::Medium => AdaptiveWhisperConfig {
-                    beam_size: 2,  // Balanced
-                    temperature: 0.3,
-                    use_gpu: self.has_gpu_acceleration,
-                    max_threads: Some(self.cpu_cores.min(4) as usize),
-                    chunk_size_preference: ChunkSizePreference::Balanced,
-                },
-                PerformanceTier::Low => AdaptiveWhisperConfig {
-                    beam_size: 1,  // Fast processing
-                    temperature: 0.4,
-                    use_gpu: false, // Force CPU to avoid GPU overhead on weak hardware
-                    max_threads: Some(2),
-                    chunk_size_preference: ChunkSizePreference::Fast,
-                },
+                }
             }
+
+            #[cfg(not(target_os = "windows"))]
+            {
+                match self.performance_tier {
+                    PerformanceTier::Ultra => AdaptiveWhisperConfig {
+                        beam_size: 5,
+                        temperature: 0.1,
+                        use_gpu: self.has_gpu_acceleration,
+                        max_threads: Some(self.cpu_cores.min(8) as usize),
+                        chunk_size_preference: ChunkSizePreference::Quality,
+                    },
+                    PerformanceTier::High => AdaptiveWhisperConfig {
+                        beam_size: 3,
+                        temperature: 0.2,
+                        use_gpu: self.has_gpu_acceleration,
+                        max_threads: Some(self.cpu_cores.min(6) as usize),
+                        chunk_size_preference: ChunkSizePreference::Balanced,
+                    },
+                    PerformanceTier::Medium => AdaptiveWhisperConfig {
+                        beam_size: 2,
+                        temperature: 0.3,
+                        use_gpu: self.has_gpu_acceleration,
+                        max_threads: Some(self.cpu_cores.min(4) as usize),
+                        chunk_size_preference: ChunkSizePreference::Balanced,
+                    },
+                    PerformanceTier::Low => AdaptiveWhisperConfig {
+                        beam_size: 1,
+                        temperature: 0.4,
+                        use_gpu: false,
+                        max_threads: Some(2),
+                        chunk_size_preference: ChunkSizePreference::Fast,
+                    },
+                }
+            }
+        };
+
+        // Beam search multiplies Whisper scratch RAM. Cap it on smaller machines
+        // and CPU-only builds so batch transcription does not OOM.
+        if self.memory_gb < 8 {
+            config.beam_size = 1;
+            config.max_threads = Some(config.max_threads.unwrap_or(4).min(2));
+        } else if self.memory_gb < 16 || !self.has_gpu_acceleration {
+            config.beam_size = config.beam_size.min(2);
         }
+
+        config
     }
 
     /// Get recommended chunk duration in milliseconds based on performance tier

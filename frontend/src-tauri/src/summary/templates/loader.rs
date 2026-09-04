@@ -217,6 +217,89 @@ pub fn list_templates() -> Vec<(String, String, String)> {
     templates
 }
 
+/// True if this id has a file in the user's custom templates directory
+/// (either a new template or an override of a built-in one).
+pub fn is_custom_template(template_id: &str) -> bool {
+    let Some(custom_dir) = get_custom_templates_dir() else {
+        return false;
+    };
+    custom_dir.join(format!("{}.json", template_id)).is_file()
+}
+
+fn sanitize_template_id(raw: &str) -> Result<String, String> {
+    let mapped: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    let mut out = String::new();
+    let mut prev_us = false;
+    for c in mapped.chars() {
+        if c == '_' {
+            if !prev_us {
+                out.push(c);
+            }
+            prev_us = true;
+        } else {
+            out.push(c);
+            prev_us = false;
+        }
+    }
+    let out = out.trim_matches('_').to_string();
+    if out.is_empty() {
+        return Err("Template id cannot be empty".to_string());
+    }
+    if out == "." || out == ".." {
+        return Err("Invalid template id".to_string());
+    }
+    Ok(out)
+}
+
+/// Save a template into the user's custom templates directory.
+/// Overwrites an existing custom file with the same id (including built-in overrides).
+pub fn save_custom_template(template_id: &str, template: &Template) -> Result<String, String> {
+    template.validate()?;
+    let id = sanitize_template_id(template_id)?;
+    let custom_dir = get_custom_templates_dir()
+        .ok_or_else(|| "Could not resolve custom templates directory".to_string())?;
+
+    std::fs::create_dir_all(&custom_dir)
+        .map_err(|e| format!("Failed to create templates directory: {}", e))?;
+
+    let path = custom_dir.join(format!("{}.json", id));
+    let json = serde_json::to_string_pretty(template)
+        .map_err(|e| format!("Failed to serialize template: {}", e))?;
+    std::fs::write(&path, json)
+        .map_err(|e| format!("Failed to write template: {}", e))?;
+
+    info!("Saved custom template '{}' to {:?}", id, path);
+    Ok(id)
+}
+
+/// Delete a custom template file. Built-in templates cannot be removed this way;
+/// deleting an override restores the built-in version.
+pub fn delete_custom_template(template_id: &str) -> Result<(), String> {
+    let id = sanitize_template_id(template_id)?;
+    if !is_custom_template(&id) {
+        return Err(format!(
+            "Template '{}' is built-in and cannot be deleted. Save a custom copy to replace it.",
+            id
+        ));
+    }
+    let custom_dir = get_custom_templates_dir()
+        .ok_or_else(|| "Could not resolve custom templates directory".to_string())?;
+    let path = custom_dir.join(format!("{}.json", id));
+    std::fs::remove_file(&path).map_err(|e| format!("Failed to delete template: {}", e))?;
+    info!("Deleted custom template '{}' at {:?}", id, path);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

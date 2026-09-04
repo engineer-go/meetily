@@ -1,3 +1,5 @@
+import { X } from 'lucide-react';
+
 interface StatusOverlaysProps {
   // Status flags
   isProcessing: boolean;      // Processing transcription after recording stops
@@ -5,6 +7,10 @@ interface StatusOverlaysProps {
 
   // Layout
   sidebarCollapsed: boolean;  // For responsive margin calculation
+  processingMessage?: string;
+  savingMessage?: string;
+  onCancelProcessing?: () => void;
+  onViewMeeting?: () => void;
 }
 
 // Internal reusable component for individual status overlays
@@ -12,13 +18,15 @@ interface StatusOverlayProps {
   show: boolean;
   message: string;
   sidebarCollapsed: boolean;
+  onCancel?: () => void;
+  onViewMeeting?: () => void;
 }
 
-function StatusOverlay({ show, message, sidebarCollapsed }: StatusOverlayProps) {
+function StatusOverlay({ show, message, sidebarCollapsed, onCancel, onViewMeeting }: StatusOverlayProps) {
   if (!show) return null;
 
   return (
-    <div className="fixed bottom-4 left-0 right-0 z-10">
+    <div className="fixed bottom-4 left-0 right-0 z-40 pointer-events-none">
       <div
         className="flex justify-center pl-8 transition-[margin] duration-300"
         style={{
@@ -26,9 +34,29 @@ function StatusOverlay({ show, message, sidebarCollapsed }: StatusOverlayProps) 
         }}
       >
         <div className="w-2/3 max-w-[750px] flex justify-center">
-          <div className="bg-white rounded-lg shadow-lg px-4 py-2 flex items-center space-x-2">
+          <div className="pointer-events-auto bg-white rounded-lg shadow-lg px-4 py-2 flex items-center space-x-3">
             <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-gray-900"></div>
             <span className="text-sm text-gray-700">{message}</span>
+            {onViewMeeting && (
+              <button
+                type="button"
+                onClick={onViewMeeting}
+                className="shrink-0 rounded-md px-2 py-1 text-sm font-medium text-blue-700 hover:bg-blue-50"
+              >
+                View meeting
+              </button>
+            )}
+            {onCancel && (
+              <button
+                type="button"
+                onClick={onCancel}
+                className="shrink-0 rounded-md p-0.5 text-gray-500 hover:bg-gray-100 hover:text-gray-800"
+                title="Cancel transcription"
+                aria-label="Cancel transcription"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -40,22 +68,28 @@ function StatusOverlay({ show, message, sidebarCollapsed }: StatusOverlayProps) 
 export function StatusOverlays({
   isProcessing,
   isSaving,
-  sidebarCollapsed
+  sidebarCollapsed,
+  processingMessage,
+  savingMessage,
+  onCancelProcessing,
+  onViewMeeting
 }: StatusOverlaysProps) {
   return (
     <>
-      {/* Processing status overlay - shown after recording stops while finalizing transcription */}
+      {/* Saving status overlay - shown first while the audio file / meeting is written */}
       <StatusOverlay
-        show={isProcessing}
-        message="Finalizing transcription..."
+        show={isSaving}
+        message={savingMessage || 'Saving audio file...'}
         sidebarCollapsed={sidebarCollapsed}
       />
 
-      {/* Saving status overlay - shown while saving transcript to database */}
+      {/* Processing status overlay - shown after the file is saved while transcription runs */}
       <StatusOverlay
-        show={isSaving}
-        message="Saving transcript..."
+        show={isProcessing && !isSaving}
+        message={processingMessage || 'File saved, starting transcription...'}
         sidebarCollapsed={sidebarCollapsed}
+        onCancel={onCancelProcessing}
+        onViewMeeting={onViewMeeting}
       />
     </>
   );

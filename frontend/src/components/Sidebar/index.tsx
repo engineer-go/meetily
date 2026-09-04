@@ -10,6 +10,7 @@ import { ModelConfig } from '@/components/ModelSettingsModal';
 import { SettingTabs } from '../SettingTabs';
 import { TranscriptModelProps } from '@/components/TranscriptSettings';
 import Analytics from '@/lib/analytics';
+import { openHome, openMeetingDetails } from '@/lib/meetingNavigation';
 import { invoke } from '@tauri-apps/api/core';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from 'sonner';
@@ -344,7 +345,7 @@ const Sidebar: React.FC = () => {
       // If deleting the active meeting, navigate to home
       if (currentMeeting?.id === itemId) {
         setCurrentMeeting({ id: 'intro-call', title: '+ New Call' });
-        router.push('/');
+        openHome();
       }
     } catch (error) {
       console.error('Failed to delete meeting:', error);
@@ -459,7 +460,7 @@ const Sidebar: React.FC = () => {
           <Tooltip>
             <TooltipTrigger asChild>
               <button
-                onClick={() => router.push('/')}
+                onClick={() => openHome()}
                 className={`p-2 rounded-lg transition-colors duration-150 ${isHomePage ? 'bg-gray-100' : 'hover:bg-gray-100'
                   }`}
               >
@@ -576,11 +577,15 @@ const Sidebar: React.FC = () => {
           onClick={() => {
             if (item.type === 'folder') {
               toggleFolder(item.id);
+            } else if (item.id.startsWith('intro-call')) {
+              setCurrentMeeting({ id: item.id, title: item.title });
+              openHome();
+            } else if (item.id.includes('-')) {
+              setCurrentMeeting({ id: item.id, title: item.title });
+              openMeetingDetails(item.id);
             } else {
               setCurrentMeeting({ id: item.id, title: item.title });
-              const basePath = item.id.startsWith('intro-call') ? '/' :
-                item.id.includes('-') ? `/meeting-details?id=${item.id}` : `/notes/${item.id}`;
-              router.push(basePath);
+              router.push(`/notes/${item.id}`);
             }
           }}
         >
@@ -724,7 +729,7 @@ const Sidebar: React.FC = () => {
           <div className="flex-shrink-0">
             {!isCollapsed && (
               <div
-                onClick={() => router.push('/')}
+                onClick={() => openHome()}
                 className="p-3  text-lg font-semibold items-center hover:bg-gray-100 h-10   flex mx-3 mt-3 rounded-lg cursor-pointer"
               >
                 <Home className="w-4 h-4 mr-2" />

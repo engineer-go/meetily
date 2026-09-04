@@ -1,4 +1,4 @@
-use crate::summary::templates;
+use crate::summary::templates::{self, Template, TemplateSection};
 use serde::{Deserialize, Serialize};
 use tauri::Runtime;
 use tracing::{info, warn};
@@ -14,22 +14,45 @@ pub struct TemplateInfo {
 
     /// Brief description of the template's purpose
     pub description: String,
+
+    /// True when a user-saved file exists for this id
+    pub is_custom: bool,
 }
 
-/// Detailed template structure for preview/debugging
+/// Full template payload for the editor UI
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TemplateDetails {
-    /// Template identifier
     pub id: String,
-
-    /// Display name
     pub name: String,
-
-    /// Description
     pub description: String,
+    pub sections: Vec<TemplateSection>,
+    pub is_custom: bool,
+}
 
-    /// List of section titles in order
-    pub sections: Vec<String>,
+#[tauri::command]
+pub async fn api_save_custom_template<R: Runtime>(
+    _app: tauri::AppHandle<R>,
+    id: String,
+    name: String,
+    description: String,
+    sections: Vec<TemplateSection>,
+) -> Result<TemplateInfo, String> {
+    info!("api_save_custom_template called for id '{}'", id);
+
+    let template = Template {
+        name,
+        description,
+        sections,
+    };
+    let saved_id = templates::save_custom_template(&id, &template)?;
+    let saved = templates::get_template(&saved_id)?;
+
+    Ok(TemplateInfo {
+        id: saved_id,
+        name: saved.name,
+        description: saved.description,
+        is_custom: true,
+    })
 }
 
 /// Lists all available templates
@@ -49,10 +72,14 @@ pub async fn api_list_templates<R: Runtime>(
 
     let template_infos: Vec<TemplateInfo> = templates
         .into_iter()
-        .map(|(id, name, description)| TemplateInfo {
-            id,
-            name,
-            description,
+        .map(|(id, name, description)| {
+            let is_custom = templates::is_custom_template(&id);
+            TemplateInfo {
+                id,
+                name,
+                description,
+                is_custom,
+            }
         })
         .collect();
 
@@ -76,18 +103,14 @@ pub async fn api_get_template_details<R: Runtime>(
     info!("api_get_template_details called for template_id: {}", template_id);
 
     let template = templates::get_template(&template_id)?;
-
-    let section_titles: Vec<String> = template
-        .sections
-        .iter()
-        .map(|section| section.title.clone())
-        .collect();
+    let is_custom = templates::is_custom_template(&template_id);
 
     let details = TemplateDetails {
         id: template_id,
         name: template.name,
         description: template.description,
-        sections: section_titles,
+        sections: template.sections,
+        is_custom,
     };
 
     info!("Retrieved template details for '{}'", details.name);
@@ -123,18 +146,18 @@ pub async fn api_validate_template<R: Runtime>(
     }
 }
 
+#[tauri::command]
+pub async fn api_delete_custom_template<R: Runtime>(
+    _app: tauri::AppHandle<R>,
+    template_id: String,
+) -> Result<(), String> {
+    info!("api_delete_custom_template called for '{}'", template_id);
+    templates::delete_custom_template(&template_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn test_list_templates() {
-        // This test requires the templates to be embedded/available
-        // In a real test environment, you might want to mock the templates module
-
-        // For now, just verify the function compiles and runs
-        // You can expand this with more specific assertions
-    }
 
     #[tokio::test]
     async fn test_validate_template_valid() {
@@ -151,8 +174,6 @@ mod tests {
             ]
         }"#;
 
-        // Mock app handle would be needed for actual testing
-        // For now, test the validation logic directly
         let result = templates::validate_and_parse_template(valid_json);
         assert!(result.is_ok());
     }

@@ -1,5 +1,5 @@
 use crate::api::TranscriptSegment;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use log::{debug, info};
 use once_cell::sync::Lazy;
 use std::path::Path;
@@ -100,6 +100,124 @@ pub(crate) fn write_transcripts_json(folder: &Path, segments: &[TranscriptSegmen
         transcript_path.display()
     );
     Ok(())
+}
+
+/// 2-minute windows keep VAD copies and Whisper scratch bounded.
+pub(crate) const BATCH_WINDOW_SAMPLES: usize = 2 * 60 * 16000;
+/// Whisper.cpp is designed around ~30s; 15s limits CPU scratch RAM.
+pub(crate) const BATCH_MAX_SEGMENT_SAMPLES: usize = 15 * 16000;
+
+/// Run VAD + transcription over 16kHz mono audio in fixed time windows.
+///
+/// Avoids holding every speech segment from a long recording in memory at once.
+pub(crate) async fn transcribe_in_memory_windows<F, Fut>(
+    samples_16k: &[f32],
+    redemption_time_ms: u32,
+    progress_start: u32,
+    progress_span: u32,
+    mut emit_progress: impl FnMut(u32, &str),
+    is_cancelled: impl Fn() -> bool,
+    mut transcribe_samples: F,
+) -> Result<(Vec<(String, f64, f64)>, f32, usize)>
+where
+    F: FnMut(Vec<f32>) -> Fut,
+    Fut: std::future::Future<Output = Result<(String, f32)>>,
+{
+    use crate::audio::vad::get_speech_chunks_with_progress;
+
+    let total = samples_16k.len();
+    if total == 0 {
+        return Ok((Vec::new(), 0.0, 0));
+    }
+
+    let mut all_transcripts = Vec::new();
+    let mut total_confidence = 0.0f32;
+    let mut transcribed_count = 0usize;
+    let mut processable_count = 0usize;
+    let mut offset = 0usize;
+    let window_count = total.div_ceil(BATCH_WINDOW_SAMPLES);
+
+    while offset < total {
+        if is_cancelled() {
+            return Err(anyhow!("Transcription cancelled"));
+        }
+
+        let end = (offset + BATCH_WINDOW_SAMPLES).min(total);
+        let window = &samples_16k[offset..end];
+        let offset_ms = offset as f64 / 16.0;
+        let window_idx = offset / BATCH_WINDOW_SAMPLES + 1;
+        let window_progress = progress_start
+            + ((offset as f32 / total as f32) * progress_span as f32) as u32;
+
+        emit_progress(
+            window_progress,
+            &format!(
+                "Detecting speech in window {}/{}...",
+                window_idx, window_count
+            ),
+        );
+
+        let mut segments = get_speech_chunks_with_progress(window, redemption_time_ms, |_, _| {
+            !is_cancelled()
+        })?;
+        for segment in &mut segments {
+            segment.start_timestamp_ms += offset_ms;
+            segment.end_timestamp_ms += offset_ms;
+        }
+
+        let mut processable = Vec::new();
+        for segment in segments {
+            if segment.samples.len() > BATCH_MAX_SEGMENT_SAMPLES {
+                processable.extend(split_segment_at_silence(
+                    &segment,
+                    BATCH_MAX_SEGMENT_SAMPLES,
+                ));
+            } else {
+                processable.push(segment);
+            }
+        }
+        processable_count += processable.len();
+
+        for mut segment in processable {
+            if is_cancelled() {
+                return Err(anyhow!("Transcription cancelled"));
+            }
+            if segment.samples.len() < 1600 {
+                continue;
+            }
+
+            let duration_sec =
+                (segment.end_timestamp_ms - segment.start_timestamp_ms) / 1000.0;
+            emit_progress(
+                window_progress.min(progress_start + progress_span),
+                &format!(
+                    "Transcribing {:.1}s at {:.0}s...",
+                    duration_sec,
+                    segment.start_timestamp_ms / 1000.0
+                ),
+            );
+
+            let start_ms = segment.start_timestamp_ms;
+            let end_ms = segment.end_timestamp_ms;
+            let samples = std::mem::take(&mut segment.samples);
+            let (text, conf) = transcribe_samples(samples).await?;
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                all_transcripts.push((text, start_ms, end_ms));
+                total_confidence += conf;
+                transcribed_count += 1;
+            }
+        }
+
+        offset = end;
+    }
+
+    let avg_confidence = if transcribed_count > 0 {
+        total_confidence / transcribed_count as f32
+    } else {
+        0.0
+    };
+    Ok((all_transcripts, avg_confidence, processable_count))
 }
 
 /// Split a long speech segment at the lowest-energy (silence) point near the target size.

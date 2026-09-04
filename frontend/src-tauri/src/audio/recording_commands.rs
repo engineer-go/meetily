@@ -89,6 +89,13 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         return Err("Recording already in progress".to_string());
     }
 
+    if super::retranscription::is_retranscription_in_progress() {
+        return Err(
+            "The previous recording is still being transcribed. Wait for it to finish before starting a new one."
+                .to_string(),
+        );
+    }
+
     // Validate that transcription models are available before starting recording
     info!("🔍 Validating transcription model availability before starting recording...");
     if let Err(validation_error) = transcription::validate_transcription_model_ready(&app).await {
@@ -335,6 +342,13 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         return Err("Recording already in progress".to_string());
     }
 
+    if super::retranscription::is_retranscription_in_progress() {
+        return Err(
+            "The previous recording is still being transcribed. Wait for it to finish before starting a new one."
+                .to_string(),
+        );
+    }
+
     // Validate that transcription models are available before starting recording
     info!("🔍 Validating transcription model availability before starting recording...");
     if let Err(validation_error) = transcription::validate_transcription_model_ready(&app).await {
@@ -544,7 +558,35 @@ pub async fn stop_recording<R: Runtime>(
         }
     }
 
-    // Step 2: Signal transcription workers to finish processing ALL queued chunks
+    let transcribe_after_save = match super::recording_preferences::load_recording_preferences(&app).await {
+        Ok(prefs) => prefs.transcribe_after_save && prefs.auto_save,
+        Err(_) => true,
+    };
+
+    // Step 2: Either abort live transcription so the file can be saved first,
+    // or wait for remaining live chunks (legacy path).
+    let transcription_task = {
+        let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
+        global_task.take()
+    };
+
+    if transcribe_after_save {
+        let _ = app.emit(
+            "recording-shutdown-progress",
+            serde_json::json!({
+                "stage": "saving_audio",
+                "message": "Saving audio file...",
+                "progress": 40
+            }),
+        );
+
+        if let Some(task_handle) = transcription_task {
+            info!("⏩ Save-first mode: aborting live transcription so the audio file can be written immediately");
+            task_handle.abort();
+        } else {
+            info!("ℹ️ No live transcription task to abort");
+        }
+    } else {
     let _ = app.emit(
         "recording-shutdown-progress",
         serde_json::json!({
@@ -553,12 +595,6 @@ pub async fn stop_recording<R: Runtime>(
             "progress": 40
         }),
     );
-
-    // Wait for transcription task with enhanced progress monitoring (NO TIMEOUT - we must process all chunks)
-    let transcription_task = {
-        let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
-        global_task.take()
-    };
 
     if let Some(task_handle) = transcription_task {
         info!("⏳ Waiting for ALL transcription chunks to be processed (no timeout - preserving every chunk)");
@@ -609,8 +645,11 @@ pub async fn stop_recording<R: Runtime>(
     } else {
         info!("ℹ️ No transcription task found to wait for");
     }
+    }
 
-    // Step 3: Now safely unload Whisper model after ALL chunks are processed
+    // Step 3: Unload the model only when we finished live transcription.
+    // Save-first mode keeps it loaded for transcribing the saved file.
+    if !transcribe_after_save {
     let _ = app.emit(
         "recording-shutdown-progress",
         serde_json::json!({
@@ -697,6 +736,9 @@ pub async fn stop_recording<R: Runtime>(
                 warn!("⚠️ No Whisper engine found to unload model");
             }
         }
+    }
+    } else {
+        info!("🧠 Save-first mode: keeping transcription model loaded for the saved audio file");
     }
 
     // Step 3.5: Track meeting ended analytics with privacy-safe metadata
@@ -803,11 +845,16 @@ pub async fn stop_recording<R: Runtime>(
     }
 
     // Step 4: Finalize recording state and cleanup resources safely
+    let finalize_message = if transcribe_after_save {
+        "Saving audio file..."
+    } else {
+        "Finalizing recording and cleaning up resources..."
+    };
     let _ = app.emit(
         "recording-shutdown-progress",
         serde_json::json!({
             "stage": "finalizing",
-            "message": "Finalizing recording and cleaning up resources...",
+            "message": finalize_message,
             "progress": 90
         }),
     );
@@ -879,12 +926,18 @@ pub async fn stop_recording<R: Runtime>(
     );
 
     // Emit final stop event with folder_path and meeting_name for frontend to save
+    let stop_message = if transcribe_after_save {
+        "Audio file saved - frontend will start transcription"
+    } else {
+        "Recording stopped - frontend will save after all transcripts received"
+    };
     app.emit(
         "recording-stopped",
         serde_json::json!({
-            "message": "Recording stopped - frontend will save after all transcripts received",
+            "message": stop_message,
             "folder_path": folder_path_str,
-            "meeting_name": meeting_name_str
+            "meeting_name": meeting_name_str,
+            "transcribe_after_save": transcribe_after_save
         }),
     )
     .map_err(|e| e.to_string())?;

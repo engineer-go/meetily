@@ -4,11 +4,13 @@ import { useState, useEffect, useCallback, Suspense } from "react";
 import { Transcript, Summary } from "@/types";
 import PageContent from "./page-content";
 import { useRouter, useSearchParams } from "next/navigation";
+import { openHome } from "@/lib/meetingNavigation";
 import Analytics from "@/lib/analytics";
 import { invoke } from "@tauri-apps/api/core";
 import { LoaderIcon } from "lucide-react";
 import { useConfig } from "@/contexts/ConfigContext";
 import { usePaginatedTranscripts } from "@/hooks/usePaginatedTranscripts";
+import { PostSaveTranscriptionBanner } from "@/components/MeetingDetails/PostSaveTranscriptionBanner";
 
 interface MeetingDetailsResponse {
   id: string;
@@ -23,6 +25,7 @@ function MeetingDetailsContent() {
   const searchParams = useSearchParams();
   const meetingId = searchParams.get('id');
   const source = searchParams.get('source'); // Check if navigated from recording
+  const transcribing = searchParams.get('transcribing') === '1';
   const { setCurrentMeeting, refetchMeetings, stopSummaryPolling } = useSidebar();
   const { isAutoSummary } = useConfig(); // Get auto-summary toggle state
   const router = useRouter();
@@ -32,6 +35,7 @@ function MeetingDetailsContent() {
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [shouldAutoGenerate, setShouldAutoGenerate] = useState<boolean>(false);
   const [hasCheckedAutoGen, setHasCheckedAutoGen] = useState<boolean>(false);
+  const [hideTranscriptionBanner, setHideTranscriptionBanner] = useState(false);
 
   // Use pagination hook for efficient transcript loading
   const {
@@ -47,6 +51,19 @@ function MeetingDetailsContent() {
     refetch,
     error: transcriptError,
   } = usePaginatedTranscripts({ meetingId: meetingId || '' });
+
+  useEffect(() => {
+    setHideTranscriptionBanner(false);
+  }, [meetingId]);
+
+  const dismissTranscriptionBanner = useCallback(() => {
+    setHideTranscriptionBanner(true);
+    void refetch();
+    const params = new URLSearchParams(searchParams.toString());
+    params.delete('transcribing');
+    router.replace(`/meeting-details?${params.toString()}`);
+    setHasCheckedAutoGen(false);
+  }, [refetch, router, searchParams]);
 
   // Check if gemma3:1b model is available in Ollama
   const checkForGemmaModel = useCallback(async (): Promise<boolean> => {
@@ -65,10 +82,14 @@ function MeetingDetailsContent() {
   const setupAutoGeneration = useCallback(async () => {
     if (hasCheckedAutoGen) return; // Only check once
 
-    // Only auto-generate if navigated from recording
+    // Only auto-generate if navigated from recording and post-save transcription is done
     if (source !== 'recording') {
       console.log('Not from recording navigation, skipping auto-generation');
       setHasCheckedAutoGen(true);
+      return;
+    }
+    if (transcribing) {
+      console.log('Post-save transcription still running, delaying auto-generation');
       return;
     }
 
@@ -114,7 +135,7 @@ function MeetingDetailsContent() {
     }
 
     setHasCheckedAutoGen(true);
-  }, [hasCheckedAutoGen, checkForGemmaModel, source, isAutoSummary]);
+  }, [hasCheckedAutoGen, checkForGemmaModel, source, isAutoSummary, transcribing]);
 
   // Sync meeting metadata from pagination hook to meeting details state
   useEffect(() => {
@@ -341,7 +362,7 @@ function MeetingDetailsContent() {
         <div className="text-center">
           <p className="text-red-500 mb-4">{error}</p>
           <button
-            onClick={() => router.push('/')}
+            onClick={() => openHome()}
             className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
           >
             Go Back
@@ -351,14 +372,30 @@ function MeetingDetailsContent() {
     );
   }
 
+  const transcriptionBanner = meetingId && transcribing && !hideTranscriptionBanner ? (
+    <PostSaveTranscriptionBanner
+      meetingId={meetingId}
+      active
+      onComplete={dismissTranscriptionBanner}
+    />
+  ) : null;
+
   // Show loading spinner while initial data loads
   if ((isLoading || isLoadingTranscripts) || !meetingDetails) {
-    return <div className="flex items-center justify-center h-screen">
-      <LoaderIcon className="animate-spin size-6 " />
-    </div>;
+    return (
+      <>
+        {transcriptionBanner}
+        <div className="flex items-center justify-center h-screen">
+          <LoaderIcon className="animate-spin size-6 " />
+        </div>
+      </>
+    );
   }
 
-  return <PageContent
+  return (
+    <>
+      {transcriptionBanner}
+      <PageContent
     meeting={meetingDetails}
     summaryData={meetingSummary}
     shouldAutoGenerate={shouldAutoGenerate}
@@ -377,7 +414,9 @@ function MeetingDetailsContent() {
     totalCount={totalCount}
     loadedCount={loadedCount}
     onLoadMore={loadMore}
-  />;
+  />
+    </>
+  );
 }
 
 export default function MeetingDetails() {

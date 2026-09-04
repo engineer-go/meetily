@@ -10,19 +10,14 @@ import {
 import { VisuallyHidden } from "@/components/ui/visually-hidden"
 import { Button } from '@/components/ui/button';
 import { ButtonGroup } from '@/components/ui/button-group';
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu';
-import { Sparkles, Settings, Loader2, FileText, Check, Square } from 'lucide-react';
+import { Sparkles, Settings, Loader2, FileText, Square } from 'lucide-react';
 import Analytics from '@/lib/analytics';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
-import { useState, useEffect, useRef, ReactNode } from 'react';
+import { useState, useEffect, ReactNode } from 'react';
 import { isOllamaNotInstalledError } from '@/lib/utils';
 import { BuiltInModelInfo } from '@/lib/builtin-ai';
+import { SummaryTemplateDialog, TemplateInfo } from '@/components/MeetingDetails/SummaryTemplateDialog';
 
 interface SummaryGeneratorButtonGroupProps {
   languageSlot?: ReactNode;
@@ -33,9 +28,10 @@ interface SummaryGeneratorButtonGroupProps {
   onStopGeneration: () => void;
   customPrompt: string;
   summaryStatus: 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
-  availableTemplates: Array<{ id: string, name: string, description: string }>;
+  availableTemplates: TemplateInfo[];
   selectedTemplate: string;
   onTemplateSelect: (templateId: string, templateName: string) => void;
+  onTemplatesChanged?: () => Promise<void> | void;
   hasTranscripts?: boolean;
   hasSummary?: boolean;
   isModelConfigLoading?: boolean;
@@ -53,6 +49,7 @@ export function SummaryGeneratorButtonGroup({
   availableTemplates,
   selectedTemplate,
   onTemplateSelect,
+  onTemplatesChanged,
   hasTranscripts = true,
   hasSummary = false,
   isModelConfigLoading = false,
@@ -61,6 +58,7 @@ export function SummaryGeneratorButtonGroup({
 }: SummaryGeneratorButtonGroupProps) {
   const [isCheckingModels, setIsCheckingModels] = useState(false);
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false);
+  const [templateDialogOpen, setTemplateDialogOpen] = useState(false);
 
   // Expose the function to open the modal via callback registration
   useEffect(() => {
@@ -324,37 +322,26 @@ export function SummaryGeneratorButtonGroup({
         </DialogContent>
       </Dialog>
 
-      {/* Template selector dropdown */}
-      {availableTemplates.length > 0 && (
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button
-              variant="outline"
-              size="sm"
-              title="Select summary template"
-            >
-              <FileText />
-              <span className="hidden lg:inline">Template</span>
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
-            {availableTemplates.map((template) => (
-              <DropdownMenuItem
-                key={template.id}
-                onClick={() => onTemplateSelect(template.id, template.name)}
-                title={template.description}
-                className="flex items-center justify-between gap-2"
-              >
-                <span>{template.name}</span>
-                {selectedTemplate === template.id && (
-                  <Check className="h-4 w-4 text-green-600" />
-                )}
-              </DropdownMenuItem>
-            ))}
-
-          </DropdownMenuContent>
-        </DropdownMenu>
-      )}
+      {/* Template picker and editor */}
+      <Button
+        variant="outline"
+        size="sm"
+        title="View and edit summary templates"
+        onClick={() => setTemplateDialogOpen(true)}
+      >
+        <FileText />
+        <span className="max-w-[160px] truncate">
+          {availableTemplates.find((template) => template.id === selectedTemplate)?.name || 'Template'}
+        </span>
+      </Button>
+      <SummaryTemplateDialog
+        open={templateDialogOpen}
+        onOpenChange={setTemplateDialogOpen}
+        templates={availableTemplates}
+        selectedTemplateId={selectedTemplate}
+        onSelect={onTemplateSelect}
+        onTemplatesChanged={onTemplatesChanged ?? (async () => undefined)}
+      />
     </ButtonGroup>
   );
 }

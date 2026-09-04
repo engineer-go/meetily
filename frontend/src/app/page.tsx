@@ -10,6 +10,7 @@ import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useConfig } from '@/contexts/ConfigContext';
 import { StatusOverlays } from '@/app/_components/StatusOverlays';
 import Analytics from '@/lib/analytics';
+import { openMeetingDetails } from '@/lib/meetingNavigation';
 import { SettingsModals } from './_components/SettingsModal';
 import { TranscriptPanel } from './_components/TranscriptPanel';
 import { useModalState } from '@/hooks/useModalState';
@@ -20,7 +21,6 @@ import { useTranscriptRecovery } from '@/hooks/useTranscriptRecovery';
 import { TranscriptRecovery } from '@/components/TranscriptRecovery';
 import { indexedDBService } from '@/services/indexedDBService';
 import { toast } from 'sonner';
-import { useRouter } from 'next/navigation';
 
 export default function Home() {
   // Local page state (not moved to contexts)
@@ -34,7 +34,7 @@ export default function Home() {
   const recordingState = useRecordingState();
 
   // Extract status from global state
-  const { status, isStopping, isProcessing, isSaving } = recordingState;
+  const { status, isStopping, isProcessing, isSaving, statusMessage } = recordingState;
 
   // Hooks
   const { hasMicrophone } = usePermissionCheck();
@@ -44,7 +44,7 @@ export default function Home() {
   const { handleRecordingStart } = useRecordingStart(isRecording, setIsRecordingState, showModal);
 
   // Get handleRecordingStop function and setIsStopping (state comes from global context)
-  const { handleRecordingStop, setIsStopping } = useRecordingStop(
+  const { handleRecordingStop, cancelPostSaveTranscription, openSavedMeeting, savedMeetingId, setIsStopping } = useRecordingStop(
     setIsRecordingState,
     setIsRecordingDisabled
   );
@@ -59,8 +59,6 @@ export default function Home() {
     loadMeetingTranscripts,
     deleteRecoverableMeeting
   } = useTranscriptRecovery();
-
-  const router = useRouter();
 
   useEffect(() => {
     // Track page view
@@ -131,7 +129,7 @@ export default function Home() {
           action: result.meetingId ? {
             label: 'View Meeting',
             onClick: () => {
-              router.push(`/meeting-details?id=${result.meetingId}`);
+              openMeetingDetails(result.meetingId!);
             }
           } : undefined,
           duration: 10000,
@@ -145,11 +143,8 @@ export default function Home() {
           sessionStorage.removeItem('recovery_dialog_shown');
         }
 
-        // Auto-navigate after a short delay
         if (result.meetingId) {
-          setTimeout(() => {
-            router.push(`/meeting-details?id=${result.meetingId}`);
-          }, 2000);
+          openMeetingDetails(result.meetingId);
         }
       }
     } catch (error) {
@@ -257,7 +252,15 @@ export default function Home() {
         <StatusOverlays
           isProcessing={status === RecordingStatus.PROCESSING_TRANSCRIPTS && !recordingState.isRecording}
           isSaving={status === RecordingStatus.SAVING}
+          processingMessage={status === RecordingStatus.PROCESSING_TRANSCRIPTS ? statusMessage : undefined}
+          savingMessage={status === RecordingStatus.SAVING ? statusMessage : undefined}
           sidebarCollapsed={sidebarCollapsed}
+          onCancelProcessing={() => {
+            void cancelPostSaveTranscription();
+          }}
+          onViewMeeting={savedMeetingId ? () => {
+            openSavedMeeting();
+          } : undefined}
         />
       </div>
     </motion.div>

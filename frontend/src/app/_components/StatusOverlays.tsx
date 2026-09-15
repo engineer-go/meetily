@@ -84,6 +84,8 @@ export function StatusOverlays({
       />
 
       {/* Processing status overlay - shown after the file is saved while transcription runs */}
+      {/* TODO: This overlay only exists on the home page. After leaving, progress is gone;
+          keep a global % indicator (or a way back into the processing view) while transcription continues. */}
       <StatusOverlay
         show={isProcessing && !isSaving}
         message={processingMessage || 'File saved, starting transcription...'}

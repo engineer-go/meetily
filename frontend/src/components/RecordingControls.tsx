@@ -399,6 +399,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
                               Analytics.trackButtonClick('start_recording', 'recording_controls');
                               handleStartRecording();
                             }}
+                            // TODO: Allow starting a second recording while the previous one is still being transcribed (`isProcessing`).
                             disabled={isStarting || isProcessing || isRecordingDisabled || isValidatingModel}
                             className={`w-12 h-12 flex items-center justify-center ${isStarting || isProcessing || isValidatingModel ? 'bg-gray-400' : 'bg-red-500 hover:bg-red-600'
                               } rounded-full text-white transition-colors relative`}

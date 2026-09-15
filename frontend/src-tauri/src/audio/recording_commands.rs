@@ -89,6 +89,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         return Err("Recording already in progress".to_string());
     }
 
+    // TODO: Allow starting a second recording while the previous one is still being transcribed.
     if super::retranscription::is_retranscription_in_progress() {
         return Err(
             "The previous recording is still being transcribed. Wait for it to finish before starting a new one."
@@ -342,6 +343,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         return Err("Recording already in progress".to_string());
     }
 
+    // TODO: Allow starting a second recording while the previous one is still being transcribed.
     if super::retranscription::is_retranscription_in_progress() {
         return Err(
             "The previous recording is still being transcribed. Wait for it to finish before starting a new one."

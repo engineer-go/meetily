@@ -582,6 +582,7 @@ const Sidebar: React.FC = () => {
               openHome();
             } else if (item.id.includes('-')) {
               setCurrentMeeting({ id: item.id, title: item.title });
+              // TODO: Re-open with transcription progress if this meeting is still being transcribed.
               openMeetingDetails(item.id);
             } else {
               setCurrentMeeting({ id: item.id, title: item.title });

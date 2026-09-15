@@ -372,6 +372,9 @@ function MeetingDetailsContent() {
     );
   }
 
+  // TODO: Leaving this page drops `transcribing=1`, so the progress UI disappears and
+  // there is no way back into it. Keep a global/persisted transcription progress (with %)
+  // or restore the banner whenever backend retranscription is still running for this meeting.
   const transcriptionBanner = meetingId && transcribing && !hideTranscriptionBanner ? (
     <PostSaveTranscriptionBanner
       meetingId={meetingId}

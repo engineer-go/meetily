@@ -31,6 +31,9 @@ function isCancellationMessage(message: string): boolean {
   return message.toLowerCase().includes('cancelled');
 }
 
+// TODO: Progress is local to this mount + `transcribing` query. Navigating away unmounts it
+// and looks like transcription finished. Rehydrate from backend (`is_retranscription_in_progress`)
+// and keep % visible globally so the user can return to the meeting while it still runs.
 export function PostSaveTranscriptionBanner({
   meetingId,
   active,
